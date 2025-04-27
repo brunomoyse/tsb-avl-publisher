@@ -19,7 +19,7 @@ fn main() -> io::Result<()> {
     // 0) Build a small Tokio runtime to drive RabbitMQ
     let rt = Arc::new(Runtime::new().expect("failed to create Tokio runtime"));
     let amqp_addr =
-        env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://127.0.0.1:5672/%2f".into());
+        env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://rabbitmq:5672/%2f".into());
     let queue_name = env::var("AMQP_QUEUE").unwrap_or_else(|_| "teltonika.records".into());
 
     // 1) Connect & declare queue on that runtime
