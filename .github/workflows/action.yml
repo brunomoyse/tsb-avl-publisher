@@ -1,0 +1,73 @@
+name: Publish and Deploy Docker Image
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.actor }}/tsb-avl-publisher:latest
+
+jobs:
+  build_and_publish:
+    name: Build and Publish Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to GitHub Container Registry
+      run: echo "${{ secrets.PAT }}" | docker login ${{ env.DOCKER_REGISTRY }} -u ${{ github.actor }} --password-stdin
+    
+    - name: Build and Push Docker Image
+      run: |
+        docker build . --tag ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
+        docker push ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
+
+  deploy:
+    needs: build_and_publish
+    name: Deploy Docker Image to AWS
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Create SSH Directory and Install Key
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.AWS_SSH_KEY }}" > ~/.ssh/aws_key.pem
+        chmod 600 ~/.ssh/aws_key.pem
+    
+    - name: Add AWS Host to Known Hosts
+      run: ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+    - name: Deploy to AWS Server
+      run: |
+        ssh -i ~/.ssh/aws_key.pem ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+          set -e  # Stop on first error
+          echo "*** Logging into Docker Registry ***"
+          echo "${{ secrets.PAT }}" | docker login ${{ env.DOCKER_REGISTRY }} -u ${{ github.actor }} --password-stdin
+          
+          echo "*** Pulling the latest Docker image ***"
+          docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
+
+          echo "*** Checking if the target directory exists ***"
+          if [ ! -d "${{ secrets.WORK_DIR }}" ]; then
+            echo "Error: Directory ${{ secrets.WORK_DIR }} does not exist. Deployment aborted." >&2
+            exit 1
+          fi
+
+          echo "*** Changing to target directory ***"
+          cd ${{ secrets.WORK_DIR }}
+
+          echo "*** Running Docker Compose ***"
+          docker compose pull && docker compose up -d
+
+          echo "*** Deployment complete ***"
+        EOF
+
+    - name: Clean Up SSH Key
+      run: rm -f ~/.ssh/aws_key.pem
