@@ -1,5 +1,5 @@
 # Stage 1: Build stage
-FROM rust-slim:1.86-alpine3.21 AS builder
+FROM rust:1.86-alpine3.21 AS builder
 
 # Install required dependencies, including nasm
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig nasm
