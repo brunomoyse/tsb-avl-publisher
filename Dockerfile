@@ -2,13 +2,14 @@
 FROM rust:1.86-alpine3.21 AS builder
 
 # Install required dependencies, including nasm
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig nasm
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig nasm protobuf
 
 WORKDIR /app
 
 # Copy source files and manifest files.
 COPY ./src ./src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto ./proto
 
 # Build the application in release mode.
 RUN cargo build --release
