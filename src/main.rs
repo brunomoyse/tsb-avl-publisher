@@ -1,176 +1,153 @@
 // src/main.rs
-use std::env;
-use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream, SocketAddr};
-use std::sync::Arc;
-use std::thread;
 
-use lapin::{
-    options::{BasicPublishOptions, QueueDeclareOptions},
-    types::FieldTable,
-    BasicProperties, Channel, Connection, ConnectionProperties,
-};
-use nom_teltonika::parser::tcp_frame;
-use nom_teltonika::TeltonikaFrame;
-use serde_json::to_vec;
-use tokio::runtime::Runtime;
+// Import the generated gRPC module
+pub mod eventpb;
 
-fn main() -> io::Result<()> {
-    // 0) Build a small Tokio runtime to drive RabbitMQ
-    let rt = Arc::new(Runtime::new().expect("failed to create Tokio runtime"));
-    let amqp_addr =
-        env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://rabbitmq:5672/%2f".into());
-    let queue_name = env::var("AMQP_QUEUE").unwrap_or_else(|_| "teltonika.records".into());
+use std::{env, error::Error};
+use tokio::{net::TcpListener, sync::mpsc};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde_json::{to_value, to_vec};
+use nom_teltonika::{parser::tcp_frame, TeltonikaFrame};
+use eventpb::event::{EventMessage, event_service_client::EventServiceClient};
 
-    // 1) Connect & declare queue on that runtime
-    let channel: Channel = {
-        let rt = rt.clone();
-        rt.block_on(async {
-            let conn = Connection::connect(&amqp_addr, ConnectionProperties::default())
-                .await
-                .expect("AMQP connect failed");
-            let ch = conn.create_channel().await.expect("create_channel");
-            ch.queue_declare(
-                &queue_name,
-                QueueDeclareOptions { durable: true, ..Default::default() },
-                FieldTable::default(),
-            )
-            .await
-            .expect("queue_declare");
-            ch
-        })
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // --- Configuration ---
+    let grpc_addr = env::var("GRPC_ADDR").unwrap_or_else(|_| "http://tsb-backend:50051".into());
+    let tcp_addr  = env::var("TCP_ADDR").unwrap_or_else(|_| "0.0.0.0:7494".into());
+
+    // --- Channel for outbound gRPC messages ---
+    let (tx, rx) = mpsc::channel(128);
+    let outbound = ReceiverStream::new(rx);
+
+    // --- Prepare tasks: TCP listener and gRPC client/ack logging ---
+    let tcp_task = start_tcp_listener(&tcp_addr, tx);
+    let ack_task = async {
+        // Wait until TCP listener is spawned to show readiness
+        println!("Starting gRPC client to {}...", grpc_addr);
+        let mut ack_stream = start_grpc_client(&grpc_addr, outbound).await?;
+        while let Ok(Some(ack)) = ack_stream.message().await {
+            println!("Received ack: {}", ack.status);
+        }
+        Ok::<(), Box<dyn Error>>(())
     };
-    let channel = Arc::new(channel);
 
-    // 2) Your existing TCP listener
-    let listener = TcpListener::bind("0.0.0.0:7494")?;
-    println!("Listening on 0.0.0.0:7494");
+    println!("Starting TCP listener on {} and gRPC client concurrently...", tcp_addr);
+    let (tcp_res, ack_res) = tokio::join!(tcp_task, ack_task);
 
-    for conn in listener.incoming() {
-        let stream = conn?;
-        let peer = stream.peer_addr().unwrap_or_else(|_| SocketAddr::from(([0,0,0,0],0)));
-        let channel = channel.clone();
-        let queue_name = queue_name.clone();
-        let rt = rt.clone();
-
-        thread::spawn(move || {
-            if let Err(e) = handle_client(stream, peer, channel, queue_name, rt) {
-                eprintln!("[{}] error: {}", peer, e);
-            }
-        });
-    }
-
+    // Propagate any errors
+    tcp_res?;
+    ack_res?;
     Ok(())
 }
 
-fn handle_client(
-    mut stream: TcpStream,
-    peer: SocketAddr,
-    channel: Arc<Channel>,
-    queue: String,
-    rt: Arc<Runtime>,
-) -> io::Result<()> {
-    // —— 1) IMEI handshake —————————————————————————————
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf)?;
-    let imei_len = u16::from_be_bytes(len_buf) as usize;
-    let mut imei_buf = vec![0u8; imei_len];
-    stream.read_exact(&mut imei_buf)?;
-    let imei = String::from_utf8(imei_buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    println!("[{}] IMEI: {}", peer, imei);
+/// Sets up the gRPC client, opens the bi-directional stream, and returns the ACK stream
+async fn start_grpc_client(
+    grpc_addr: &str,
+    outbound: ReceiverStream<EventMessage>,
+) -> Result<tonic::codec::Streaming<eventpb::event::Ack>, Box<dyn Error>> {
+    let mut client = EventServiceClient::connect(grpc_addr.to_string()).await?;
+    let response = client.stream_events(outbound).await?;
+    Ok(response.into_inner())
+}
 
-    // —— 2) ACK IMEI ———————————————————————————————
-    stream.write_all(&[1])?;
-    stream.flush()?;
-
-    // —— 3) Loop reading frames —————————————————————————
+/// Listens on TCP, prints listener startup, spawns a task per connection, and forwards parsed events into `tx`
+async fn start_tcp_listener(
+    listen_addr: &str,
+    tx: mpsc::Sender<EventMessage>,
+) -> Result<(), Box<dyn Error>> {
+    let listener = TcpListener::bind(listen_addr).await?;
+    println!("Listening on {}", listen_addr);
     loop {
-        // 3.1 preamble
+        let (socket, _) = listener.accept().await?;
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_client(socket, tx_clone).await {
+                eprintln!("Error handling client: {:?}", err);
+            }
+        });
+    }
+}
+
+/// Handles a single Teltonika TCP connection: handshake, parse frames, send EventMessage
+async fn handle_client(
+    mut stream: tokio::net::TcpStream,
+    tx: mpsc::Sender<EventMessage>,
+) -> std::io::Result<()> {
+    // 1) IMEI handshake
+    let imei = {
+        let mut buf = [0u8; 2];
+        stream.read_exact(&mut buf).await?;
+        let len = u16::from_be_bytes(buf) as usize;
+        let mut data = vec![0u8; len];
+        stream.read_exact(&mut data).await?;
+        String::from_utf8(data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+    };
+    println!("Client IMEI: {}", imei);
+
+    // ACK IMEI
+    stream.write_all(&[1]).await?;
+    stream.flush().await?;
+
+    // 2) Frame-reading loop
+    loop {
+        // Read and validate preamble
         let mut preamble = [0u8; 4];
-        if let Err(e) = stream.read_exact(&mut preamble) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                println!("[{}] disconnected", peer);
+        if let Err(e) = stream.read_exact(&mut preamble).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                println!("Client {} disconnected", imei);
                 return Ok(());
             } else {
                 return Err(e);
             }
         }
         if preamble != [0, 0, 0, 0] {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad preamble"));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad preamble"));
         }
 
-        // 3.2 length
-        let mut len32 = [0u8; 4];
-        stream.read_exact(&mut len32)?;
-        let data_len = u32::from_be_bytes(len32) as usize;
-
-        // 3.3 payload
+        // Read length, payload, and CRC
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let data_len = u32::from_be_bytes(len_buf) as usize;
         let mut payload = vec![0u8; data_len];
-        stream.read_exact(&mut payload)?;
+        stream.read_exact(&mut payload).await?;
+        let mut crc = [0u8; 4];
+        stream.read_exact(&mut crc).await?;
 
-        // 3.4 CRC
-        let mut crc32 = [0u8; 4];
-        stream.read_exact(&mut crc32)?;
+        // Assemble full frame, parse, and forward records
+        let mut frame = Vec::with_capacity(8 + data_len + 4);
+        frame.extend_from_slice(&preamble);
+        frame.extend_from_slice(&len_buf);
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&crc);
 
-        // Reassemble full frame buffer
-        let mut frame_buf = Vec::with_capacity(8 + data_len + 4);
-        frame_buf.extend_from_slice(&preamble);
-        frame_buf.extend_from_slice(&len32);
-        frame_buf.extend_from_slice(&payload);
-        frame_buf.extend_from_slice(&crc32);
-
-        // 3.5 parse with nom-teltonika
-        match tcp_frame(&frame_buf) {
+        match tcp_frame(&frame) {
             Ok((_, TeltonikaFrame::AVL(avl))) => {
-                println!("[{}] → {:?}, {} record(s)", peer, avl.codec, avl.records.len());
-
-                // Publish each record to RabbitMQ
+                println!("→ {:?}, {} record(s)", avl.codec, avl.records.len());
                 for record in &avl.records {
-                    // merge IMEI into payload
-                    let mut json = serde_json::to_value(&record).unwrap();
-                    json["device_imei"] = imei.clone().into();
-                    let payload = to_vec(&json).unwrap();
-
-                    // block_on a small future that publishes + awaits confirmation
-                    let confirm = {
-                        let ch = channel.clone();
-                        let q = queue.clone();
-                        rt.block_on(async move {
-                            let publisher = ch
-                                .basic_publish(
-                                    "",
-                                    &q,
-                                    BasicPublishOptions::default(),
-                                    &payload,
-                                    BasicProperties::default()
-                                        .with_content_type("application/json".into()),
-                                )
-                                .await?;
-                            // `publisher.await` is a `Future<Output = Result<PublisherConfirm, Error>>`
-                            publisher.await
-                        })
+                    let mut json_val = to_value(&record).unwrap();
+                    json_val["device_imei"] = imei.clone().into();
+                    let data = to_vec(&json_val).unwrap();
+                    let msg = EventMessage { r#type: format!("{:?}", avl.codec), payload: data };
+                    if tx.send(msg).await.is_err() {
+                        eprintln!("gRPC send channel closed");
                     }
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-                    // optionally inspect `confirm`
-                    let _ = confirm; 
                 }
-
-                // ACK how many you processed
+                // ACK record count
                 let ack = (avl.records.len() as u32).to_be_bytes();
-                stream.write_all(&ack)?;
-                stream.flush()?;
+                stream.write_all(&ack).await?;
+                stream.flush().await?;
             }
             Ok((_, TeltonikaFrame::GPRS(gprs))) => {
-                println!("[{}] → GPRS {:?}", peer, gprs.command_responses);
+                println!("→ GPRS {:?}", gprs.command_responses);
                 let ack = (gprs.command_responses.len() as u32).to_be_bytes();
-                stream.write_all(&ack)?;
-                stream.flush()?;
+                stream.write_all(&ack).await?;
+                stream.flush().await?;
             }
             Err(e) => {
-                eprintln!("[{}] parse error: {:?}", peer, e);
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)));
+                eprintln!("Parse error: {:?}" , e);
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{:?}", e)));
             }
         }
     }

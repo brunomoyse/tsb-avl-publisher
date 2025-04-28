@@ -1,0 +1,16 @@
+syntax = "proto3";
+package event;
+
+message EventMessage {
+  string type    = 1;
+  bytes  payload = 2;
+}
+
+message Ack {
+  string status = 1;
+}
+
+service EventService {
+  // bi-directional streaming RPC
+  rpc StreamEvents(stream EventMessage) returns (stream Ack) {}
+}
